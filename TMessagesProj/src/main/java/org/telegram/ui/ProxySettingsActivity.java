@@ -40,6 +40,7 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import androidx.core.graphics.ColorUtils;
 
@@ -54,6 +55,7 @@ import org.telegram.messenger.R;
 import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.SvgHelper;
 import org.telegram.messenger.Utilities;
+import org.telegram.messenger.XrayProxyManager;
 import org.telegram.tgnet.ConnectionsManager;
 import org.telegram.ui.ActionBar.ActionBar;
 import org.telegram.ui.ActionBar.ActionBarMenuItem;
@@ -71,7 +73,9 @@ import org.telegram.ui.Components.LayoutHelper;
 import org.telegram.ui.Components.QRCodeBottomSheet;
 import org.telegram.ui.Components.SectionsScrollView;
 
+import java.io.UnsupportedEncodingException;
 import java.net.URLEncoder;
+import java.net.URLDecoder;
 import java.util.ArrayList;
 
 public class ProxySettingsActivity extends BaseFragment {
@@ -79,6 +83,7 @@ public class ProxySettingsActivity extends BaseFragment {
     private final static int TYPE_SOCKS5 = ProxyLinkHelper.TYPE_SOCKS5;
     private final static int TYPE_MTPROTO = ProxyLinkHelper.TYPE_MTPROTO;
     public final static int TYPE_WSS = ProxyLinkHelper.TYPE_WSS;
+    public final static int TYPE_XRAY_VLESS = 3;
 
     private final static int FIELD_IP = 0;
     private final static int FIELD_PORT = 1;
@@ -87,6 +92,27 @@ public class ProxySettingsActivity extends BaseFragment {
     private final static int FIELD_SECRET = 4;
     private final static int FIELD_WSS_HOST = 5;
     private final static int FIELD_WSS_PATH = 6;
+    private final static int FIELD_VLESS_ID = 7;
+    private final static int FIELD_VLESS_ENCRYPTION = 8;
+    private final static int FIELD_VLESS_FLOW = 9;
+    private final static int FIELD_VLESS_SECURITY = 10;
+    private final static int FIELD_VLESS_TRANSPORT = 11;
+    private final static int FIELD_VLESS_SNI = 12;
+    private final static int FIELD_VLESS_HOST = 13;
+    private final static int FIELD_VLESS_PATH = 14;
+    private final static int FIELD_VLESS_SERVICE = 15;
+    private final static int FIELD_VLESS_FP = 16;
+    private final static int FIELD_VLESS_ALPN = 17;
+    private final static int FIELD_VLESS_PBK = 18;
+    private final static int FIELD_VLESS_SID = 19;
+    private final static int FIELD_VLESS_SPX = 20;
+    private final static int FIELD_VLESS_HEADER_TYPE = 21;
+    private final static int FIELD_VLESS_SEED = 22;
+    private final static int FIELD_VLESS_QUIC_SECURITY = 23;
+    private final static int FIELD_VLESS_QUIC_KEY = 24;
+    private final static int FIELD_VLESS_MODE = 25;
+    private final static int FIELD_VLESS_ALLOW_INSECURE = 26;
+    private final static int FIELD_VLESS_ADVANCED_JSON = 27;
 
     private EditTextBoldCursor[] inputFields;
     private ScrollView scrollView;
@@ -94,12 +120,15 @@ public class ProxySettingsActivity extends BaseFragment {
     private LinearLayout inputFieldsContainer;
     private HeaderCell headerCell;
     private ShadowSectionCell[] sectionCell = new ShadowSectionCell[3];
-    private TextInfoPrivacyCell[] bottomCells = new TextInfoPrivacyCell[3];
+    private TextInfoPrivacyCell[] bottomCells = new TextInfoPrivacyCell[4];
     private TextSettingsCell shareCell;
     private TextSettingsCell pasteCell;
+    private TextSettingsCell redownloadCell;
+    private TextSettingsCell xrayStatusCell;
     private ActionBarMenuItem doneItem;
-    private RadioCell[] typeCell = new RadioCell[3];
+    private RadioCell[] typeCell = new RadioCell[4];
     private EditTextBoldCursor quickProxyLinkField;
+
     private int currentType = -1;
     private int initialType = -1;
     private int wssEditorTransportMode = SharedConfig.TRANSPORT_WSS_CUSTOM;
@@ -107,6 +136,7 @@ public class ProxySettingsActivity extends BaseFragment {
     private int pasteType = -1;
     private String pasteString;
     private ProxyLinkHelper.ProxyLink pasteProxyLink;
+    private String[] pasteFields;
 
     private float shareDoneProgress = 1f;
     private float[] shareDoneProgressAnimValues = new float[2];
@@ -121,22 +151,31 @@ public class ProxySettingsActivity extends BaseFragment {
 
     private SharedConfig.ProxyInfo currentProxyInfo;
 
+    private boolean xrayStatusUpdates;
+    private final Runnable xrayStatusUpdater = new Runnable() {
+        @Override
+        public void run() {
+            if (!xrayStatusUpdates) {
+                return;
+            }
+            updateXrayStatusCell();
+            AndroidUtilities.runOnUIThread(this, 500);
+        }
+    };
+
     private boolean ignoreOnTextChange;
     private boolean ignoreQuickProxyLinkChange;
 
     private static final int done_button = 1;
 
     public static class TypeCell extends FrameLayout {
-
         private TextView textView;
         private ImageView checkImage;
         private boolean needDivider;
 
         public TypeCell(Context context) {
             super(context);
-
             setWillNotDraw(false);
-
             textView = new TextView(context);
             textView.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
             textView.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 16);
@@ -146,7 +185,6 @@ public class ProxySettingsActivity extends BaseFragment {
             textView.setEllipsize(TextUtils.TruncateAt.END);
             textView.setGravity((LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.CENTER_VERTICAL);
             addView(textView, LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, (LocaleController.isRTL ? Gravity.RIGHT : Gravity.LEFT) | Gravity.TOP, LocaleController.isRTL ? 23 + 48 : 21, 0, LocaleController.isRTL ? 21 : 23, 0));
-
             checkImage = new ImageView(context);
             checkImage.setColorFilter(new PorterDuffColorFilter(Theme.getColor(Theme.key_featuredStickers_addedIcon), PorterDuff.Mode.MULTIPLY));
             checkImage.setImageResource(R.drawable.sticker_added);
@@ -241,12 +279,15 @@ public class ProxySettingsActivity extends BaseFragment {
         AndroidUtilities.requestAdjustResize(getParentActivity(), classGuid);
         clipboardManager.addPrimaryClipChangedListener(clipChangedListener);
         updatePasteCell();
+        xrayStatusUpdates = true;
+        AndroidUtilities.runOnUIThread(xrayStatusUpdater);
     }
 
     @Override
     public void onPause() {
         super.onPause();
         clipboardManager.removePrimaryClipChangedListener(clipChangedListener);
+        xrayStatusUpdates = false;
     }
 
     @Override
@@ -282,13 +323,45 @@ public class ProxySettingsActivity extends BaseFragment {
                     currentProxyInfo.address = inputFields[FIELD_IP].getText().toString();
                     currentProxyInfo.port = Utilities.parseInt(inputFields[FIELD_PORT].getText().toString());
                     if (currentType == TYPE_SOCKS5) {
+                        currentProxyInfo.proxyType = SharedConfig.ProxyInfo.PROXY_TYPE_SOCKS5;
                         currentProxyInfo.secret = "";
                         currentProxyInfo.username = inputFields[FIELD_USER].getText().toString();
                         currentProxyInfo.password = inputFields[FIELD_PASSWORD].getText().toString();
-                    } else {
+                    } else if (currentType == TYPE_MTPROTO) {
+                        currentProxyInfo.proxyType = SharedConfig.ProxyInfo.PROXY_TYPE_MTPROTO;
                         currentProxyInfo.secret = inputFields[FIELD_SECRET].getText().toString();
                         currentProxyInfo.username = "";
                         currentProxyInfo.password = "";
+                    } else if (currentType == TYPE_XRAY_VLESS) {
+                        currentProxyInfo.proxyType = SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS;
+                        currentProxyInfo.secret = "";
+                        currentProxyInfo.username = "";
+                        currentProxyInfo.password = "";
+                        currentProxyInfo.vlessId = inputFields[FIELD_VLESS_ID].getText().toString();
+                        currentProxyInfo.vlessEncryption = inputFields[FIELD_VLESS_ENCRYPTION].getText().toString();
+                        currentProxyInfo.vlessFlow = inputFields[FIELD_VLESS_FLOW].getText().toString();
+                        currentProxyInfo.vlessSecurity = inputFields[FIELD_VLESS_SECURITY].getText().toString();
+                        currentProxyInfo.vlessType = inputFields[FIELD_VLESS_TRANSPORT].getText().toString();
+                        currentProxyInfo.vlessSni = inputFields[FIELD_VLESS_SNI].getText().toString();
+                        currentProxyInfo.vlessHost = inputFields[FIELD_VLESS_HOST].getText().toString();
+                        currentProxyInfo.vlessPath = inputFields[FIELD_VLESS_PATH].getText().toString();
+                        currentProxyInfo.vlessServiceName = inputFields[FIELD_VLESS_SERVICE].getText().toString();
+                        currentProxyInfo.vlessFp = inputFields[FIELD_VLESS_FP].getText().toString();
+                        currentProxyInfo.vlessAlpn = inputFields[FIELD_VLESS_ALPN].getText().toString();
+                        currentProxyInfo.vlessPublicKey = inputFields[FIELD_VLESS_PBK].getText().toString();
+                        currentProxyInfo.vlessShortId = inputFields[FIELD_VLESS_SID].getText().toString();
+                        currentProxyInfo.vlessSpiderX = inputFields[FIELD_VLESS_SPX].getText().toString();
+                        currentProxyInfo.vlessHeaderType = inputFields[FIELD_VLESS_HEADER_TYPE].getText().toString();
+                        currentProxyInfo.vlessSeed = inputFields[FIELD_VLESS_SEED].getText().toString();
+                        currentProxyInfo.vlessQuicSecurity = inputFields[FIELD_VLESS_QUIC_SECURITY].getText().toString();
+                        currentProxyInfo.vlessQuicKey = inputFields[FIELD_VLESS_QUIC_KEY].getText().toString();
+                        currentProxyInfo.vlessMode = inputFields[FIELD_VLESS_MODE].getText().toString();
+                        String allowInsecureValue = inputFields[FIELD_VLESS_ALLOW_INSECURE].getText().toString();
+                        currentProxyInfo.vlessAllowInsecure = "1".equals(allowInsecureValue) || "true".equalsIgnoreCase(allowInsecureValue);
+                        currentProxyInfo.vlessAdvancedJson = inputFields[FIELD_VLESS_ADVANCED_JSON].getText().toString();
+                        if (TextUtils.isEmpty(currentProxyInfo.vlessEncryption)) {
+                            currentProxyInfo.vlessEncryption = "none";
+                        }
                     }
 
                     SharedPreferences preferences = MessagesController.getGlobalMainSettings();
@@ -342,8 +415,6 @@ public class ProxySettingsActivity extends BaseFragment {
         FrameLayout frameLayout = (FrameLayout) fragmentView;
         fragmentView.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray));
 
-//        linearLayout2 = new SectionsScrollView.SectionsLinearLayout(context);
-//        scrollView = new SectionsScrollView(context, linearLayout2, resourceProvider);
         scrollView = new ScrollView(context);
         scrollView.setFillViewport(true);
         AndroidUtilities.setScrollViewEdgeEffectColor(scrollView, Theme.getColor(Theme.key_actionBarDefault));
@@ -354,8 +425,7 @@ public class ProxySettingsActivity extends BaseFragment {
         scrollView.addView(linearLayout2, new ScrollView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         final View.OnClickListener typeCellClickListener = view -> setProxyType((Integer) view.getTag(), true);
-
-        for (int a = 0; a < 3; a++) {
+        for (int a = 0; a < 4; a++) {
             typeCell[a] = new RadioCell(context);
             typeCell[a].setBackground(Theme.getSelectorDrawable(true));
             typeCell[a].setTag(a);
@@ -363,8 +433,10 @@ public class ProxySettingsActivity extends BaseFragment {
                 typeCell[a].setText(LocaleController.getString(R.string.UseProxySocks5), a == currentType, true);
             } else if (a == TYPE_MTPROTO) {
                 typeCell[a].setText(LocaleController.getString(R.string.UseProxyTelegram), a == currentType, true);
-            } else {
+            } else if (a == TYPE_WSS) {
                 typeCell[a].setText(LocaleController.getString(R.string.UseProxyWss), a == currentType, false);
+            } else {
+                typeCell[a].setText(LocaleController.getString(R.string.UseProxyXrayVless), a == currentType, false);
             }
             linearLayout2.addView(typeCell[a], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 50));
             typeCell[a].setOnClickListener(typeCellClickListener);
@@ -380,13 +452,12 @@ public class ProxySettingsActivity extends BaseFragment {
         inputFieldsContainer.setOrientation(LinearLayout.VERTICAL);
         inputFieldsContainer.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundWhite));
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            // bring to front for transitions
             inputFieldsContainer.setElevation(AndroidUtilities.dp(1f));
             inputFieldsContainer.setOutlineProvider(null);
         }
         linearLayout2.addView(inputFieldsContainer, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
-        inputFields = new EditTextBoldCursor[7];
+        inputFields = new EditTextBoldCursor[28];
         FrameLayout quickLinkContainer = new FrameLayout(context);
         inputFieldsContainer.addView(quickLinkContainer, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 64));
 
@@ -409,15 +480,9 @@ public class ProxySettingsActivity extends BaseFragment {
         quickProxyLinkField.setPadding(0, 0, 0, 0);
         quickProxyLinkField.addTextChangedListener(new TextWatcher() {
             @Override
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-
-            }
-
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override
-            public void onTextChanged(CharSequence s, int start, int before, int count) {
-
-            }
-
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
             @Override
             public void afterTextChanged(Editable s) {
                 if (ignoreQuickProxyLinkChange) {
@@ -440,7 +505,8 @@ public class ProxySettingsActivity extends BaseFragment {
 
         for (int a = 0; a < inputFields.length; a++) {
             FrameLayout container = new FrameLayout(context);
-            inputFieldsContainer.addView(container, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, 64));
+            int height = a == FIELD_VLESS_ADVANCED_JSON ? 120 : 64;
+            inputFieldsContainer.addView(container, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, height));
 
             inputFields[a] = new EditTextBoldCursor(context);
             inputFields[a].setTag(a);
@@ -461,15 +527,21 @@ public class ProxySettingsActivity extends BaseFragment {
                 inputFields[a].setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS | InputType.TYPE_TEXT_VARIATION_URI);
                 inputFields[a].addTextChangedListener(new TextWatcher() {
                     @Override
-                    public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-
-                    }
-
+                    public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
                     @Override
-                    public void onTextChanged(CharSequence s, int start, int before, int count) {
-
+                    public void onTextChanged(CharSequence s, int start, int before, int count) {}
+                    @Override
+                    public void afterTextChanged(Editable s) {
+                        checkShareDone(true);
                     }
-
+                });
+            } else if (a == FIELD_VLESS_ID) {
+                inputFields[a].setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+                inputFields[a].addTextChangedListener(new TextWatcher() {
+                    @Override
+                    public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+                    @Override
+                    public void onTextChanged(CharSequence s, int start, int before, int count) {}
                     @Override
                     public void afterTextChanged(Editable s) {
                         checkShareDone(true);
@@ -479,15 +551,9 @@ public class ProxySettingsActivity extends BaseFragment {
                 inputFields[a].setInputType(InputType.TYPE_CLASS_NUMBER);
                 inputFields[a].addTextChangedListener(new TextWatcher() {
                     @Override
-                    public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-
-                    }
-
+                    public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
                     @Override
-                    public void onTextChanged(CharSequence s, int start, int before, int count) {
-
-                    }
-
+                    public void onTextChanged(CharSequence s, int start, int before, int count) {}
                     @Override
                     public void afterTextChanged(Editable s) {
                         if (ignoreOnTextChange) {
@@ -505,7 +571,6 @@ public class ProxySettingsActivity extends BaseFragment {
                             }
                         }
                         ignoreOnTextChange = true;
-                        boolean changed;
                         int port = Utilities.parseInt(builder.toString());
                         if (port < 0 || port > 65535 || !str.equals(builder.toString())) {
                             if (port < 0) {
@@ -528,6 +593,12 @@ public class ProxySettingsActivity extends BaseFragment {
                 inputFields[a].setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
                 inputFields[a].setTypeface(Typeface.DEFAULT);
                 inputFields[a].setTransformationMethod(PasswordTransformationMethod.getInstance());
+            } else if (a == FIELD_VLESS_ALLOW_INSECURE) {
+                inputFields[a].setInputType(InputType.TYPE_CLASS_NUMBER);
+            } else if (a == FIELD_VLESS_ADVANCED_JSON) {
+                inputFields[a].setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+                inputFields[a].setMinLines(2);
+                inputFields[a].setMaxLines(6);
             } else {
                 inputFields[a].setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
             }
@@ -561,12 +632,94 @@ public class ProxySettingsActivity extends BaseFragment {
                     inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyWssPath));
                     inputFields[a].setText(currentProxyInfo.wssPath);
                     break;
+                case FIELD_VLESS_ID:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessId));
+                    inputFields[a].setText(currentProxyInfo.vlessId);
+                    break;
+                case FIELD_VLESS_ENCRYPTION:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessEncryption));
+                    inputFields[a].setText(currentProxyInfo.vlessEncryption);
+                    break;
+                case FIELD_VLESS_FLOW:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessFlow));
+                    inputFields[a].setText(currentProxyInfo.vlessFlow);
+                    break;
+                case FIELD_VLESS_SECURITY:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessSecurity));
+                    inputFields[a].setText(currentProxyInfo.vlessSecurity);
+                    break;
+                case FIELD_VLESS_TRANSPORT:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessTransport));
+                    inputFields[a].setText(currentProxyInfo.vlessType);
+                    break;
+                case FIELD_VLESS_SNI:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessSni));
+                    inputFields[a].setText(currentProxyInfo.vlessSni);
+                    break;
+                case FIELD_VLESS_HOST:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessHost));
+                    inputFields[a].setText(currentProxyInfo.vlessHost);
+                    break;
+                case FIELD_VLESS_PATH:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessPath));
+                    inputFields[a].setText(currentProxyInfo.vlessPath);
+                    break;
+                case FIELD_VLESS_SERVICE:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessServiceName));
+                    inputFields[a].setText(currentProxyInfo.vlessServiceName);
+                    break;
+                case FIELD_VLESS_FP:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessFingerprint));
+                    inputFields[a].setText(currentProxyInfo.vlessFp);
+                    break;
+                case FIELD_VLESS_ALPN:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessAlpn));
+                    inputFields[a].setText(currentProxyInfo.vlessAlpn);
+                    break;
+                case FIELD_VLESS_PBK:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessPublicKey));
+                    inputFields[a].setText(currentProxyInfo.vlessPublicKey);
+                    break;
+                case FIELD_VLESS_SID:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessShortId));
+                    inputFields[a].setText(currentProxyInfo.vlessShortId);
+                    break;
+                case FIELD_VLESS_SPX:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessSpiderX));
+                    inputFields[a].setText(currentProxyInfo.vlessSpiderX);
+                    break;
+                case FIELD_VLESS_HEADER_TYPE:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessHeaderType));
+                    inputFields[a].setText(currentProxyInfo.vlessHeaderType);
+                    break;
+                case FIELD_VLESS_SEED:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessSeed));
+                    inputFields[a].setText(currentProxyInfo.vlessSeed);
+                    break;
+                case FIELD_VLESS_QUIC_SECURITY:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessQuicSecurity));
+                    inputFields[a].setText(currentProxyInfo.vlessQuicSecurity);
+                    break;
+                case FIELD_VLESS_QUIC_KEY:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessQuicKey));
+                    inputFields[a].setText(currentProxyInfo.vlessQuicKey);
+                    break;
+                case FIELD_VLESS_MODE:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessMode));
+                    inputFields[a].setText(currentProxyInfo.vlessMode);
+                    break;
+                case FIELD_VLESS_ALLOW_INSECURE:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessAllowInsecure));
+                    inputFields[a].setText(currentProxyInfo.vlessAllowInsecure ? "1" : "");
+                    break;
+                case FIELD_VLESS_ADVANCED_JSON:
+                    inputFields[a].setHintText(LocaleController.getString(R.string.UseProxyVlessAdvancedJson));
+                    inputFields[a].setText(currentProxyInfo.vlessAdvancedJson);
+                    break;
             }
             inputFields[a].setSelection(inputFields[a].length());
-
             inputFields[a].setPadding(0, 0, 0, 0);
             container.addView(inputFields[a], LayoutHelper.createFrame(LayoutHelper.MATCH_PARENT, LayoutHelper.MATCH_PARENT, Gravity.LEFT | Gravity.TOP, 17, a == FIELD_IP || a == FIELD_WSS_HOST ? 12 : 0, 17, 0));
-
             inputFields[a].setOnEditorActionListener((textView, i, keyEvent) -> {
                 if (i == EditorInfo.IME_ACTION_NEXT) {
                     int num = (Integer) textView.getTag();
@@ -583,7 +736,7 @@ public class ProxySettingsActivity extends BaseFragment {
             });
         }
 
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 4; i++) {
             bottomCells[i] = new TextInfoPrivacyCell(context);
             bottomCells[i].setBackground(Theme.getThemedDrawableByKey(context, R.drawable.greydivider_bottom, Theme.key_windowBackgroundGrayShadow));
             if (i == 0) {
@@ -591,8 +744,11 @@ public class ProxySettingsActivity extends BaseFragment {
             } else if (i == 1) {
                 bottomCells[i].setText(LocaleController.getString(R.string.UseProxyTelegramInfo) + "\n\n" + LocaleController.getString(R.string.UseProxyTelegramInfo2) + "\n\n" + LocaleController.getString(R.string.UseProxyTelegramInfoStealth));
                 bottomCells[i].setVisibility(View.GONE);
-            } else {
+            } else if (i == 2) {
                 bottomCells[i].setText(LocaleController.getString(R.string.UseProxyWssInfo));
+                bottomCells[i].setVisibility(View.GONE);
+            } else {
+                bottomCells[i].setText(LocaleController.getString(R.string.UseProxyXrayVlessInfo));
                 bottomCells[i].setVisibility(View.GONE);
             }
             linearLayout2.addView(bottomCells[i], LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
@@ -604,7 +760,34 @@ public class ProxySettingsActivity extends BaseFragment {
         pasteCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));
         pasteCell.setOnClickListener(v -> {
             if (pasteType != -1) {
-                applyParsedProxyLink(pasteProxyLink, true);
+                if (pasteProxyLink != null) {
+                    applyParsedProxyLink(pasteProxyLink, true);
+                } else if (pasteFields != null) {
+                    for (int i = 0; i < pasteFields.length; i++) {
+                        if (pasteType == TYPE_SOCKS5 && (i == FIELD_SECRET || i >= FIELD_VLESS_ID)) {
+                            continue;
+                        }
+                        if (pasteType == TYPE_MTPROTO && (i == FIELD_USER || i == FIELD_PASSWORD || i >= FIELD_VLESS_ID)) {
+                            continue;
+                        }
+                        if (pasteType == TYPE_XRAY_VLESS && (i == FIELD_USER || i == FIELD_PASSWORD || i == FIELD_SECRET)) {
+                            continue;
+                        }
+                        if (pasteFields[i] != null) {
+                            try {
+                                inputFields[i].setText(URLDecoder.decode(pasteFields[i], "UTF-8"));
+                            } catch (UnsupportedEncodingException e) {
+                                inputFields[i].setText(pasteFields[i]);
+                            }
+                        } else {
+                            inputFields[i].setText(null);
+                        }
+                    }
+                    inputFields[0].setSelection(inputFields[0].length());
+                    setProxyType(pasteType, true, () -> {
+                        AndroidUtilities.hideKeyboard(inputFieldsContainer.findFocus());
+                    });
+                }
             }
         });
         linearLayout2.addView(pasteCell, 0, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
@@ -626,6 +809,26 @@ public class ProxySettingsActivity extends BaseFragment {
             String user = inputFields[FIELD_USER].getText().toString();
             String port = inputFields[FIELD_PORT].getText().toString();
             String secret = inputFields[FIELD_SECRET].getText().toString();
+            String vlessId = inputFields[FIELD_VLESS_ID].getText().toString();
+            String vlessEncryption = inputFields[FIELD_VLESS_ENCRYPTION].getText().toString();
+            String vlessFlow = inputFields[FIELD_VLESS_FLOW].getText().toString();
+            String vlessSecurity = inputFields[FIELD_VLESS_SECURITY].getText().toString();
+            String vlessType = inputFields[FIELD_VLESS_TRANSPORT].getText().toString();
+            String vlessSni = inputFields[FIELD_VLESS_SNI].getText().toString();
+            String vlessHost = inputFields[FIELD_VLESS_HOST].getText().toString();
+            String vlessPath = inputFields[FIELD_VLESS_PATH].getText().toString();
+            String vlessServiceName = inputFields[FIELD_VLESS_SERVICE].getText().toString();
+            String vlessFp = inputFields[FIELD_VLESS_FP].getText().toString();
+            String vlessAlpn = inputFields[FIELD_VLESS_ALPN].getText().toString();
+            String vlessPbk = inputFields[FIELD_VLESS_PBK].getText().toString();
+            String vlessSid = inputFields[FIELD_VLESS_SID].getText().toString();
+            String vlessSpx = inputFields[FIELD_VLESS_SPX].getText().toString();
+            String vlessHeaderType = inputFields[FIELD_VLESS_HEADER_TYPE].getText().toString();
+            String vlessSeed = inputFields[FIELD_VLESS_SEED].getText().toString();
+            String vlessQuicSecurity = inputFields[FIELD_VLESS_QUIC_SECURITY].getText().toString();
+            String vlessQuicKey = inputFields[FIELD_VLESS_QUIC_KEY].getText().toString();
+            String vlessMode = inputFields[FIELD_VLESS_MODE].getText().toString();
+            String vlessAllowInsecure = inputFields[FIELD_VLESS_ALLOW_INSECURE].getText().toString();
             String url;
             try {
                 if (!TextUtils.isEmpty(address)) {
@@ -645,6 +848,41 @@ public class ProxySettingsActivity extends BaseFragment {
                     params.append("mode=custom");
                     params.append("&");
                     params.append("path=").append(URLEncoder.encode(inputFields[FIELD_WSS_PATH].getText().toString(), "UTF-8"));
+                } else if (currentType == TYPE_XRAY_VLESS) {
+                    url = "vless://";
+                    if (TextUtils.isEmpty(vlessId)) {
+                        return;
+                    }
+                    StringBuilder vless = new StringBuilder();
+                    vless.append(URLEncoder.encode(vlessId, "UTF-8"));
+                    vless.append("@").append(URLEncoder.encode(address, "UTF-8"));
+                    vless.append(":").append(URLEncoder.encode(port, "UTF-8"));
+                    ArrayList<String> vlessParams = new ArrayList<>();
+                    appendVlessParam(vlessParams, "type", vlessType);
+                    appendVlessParam(vlessParams, "security", vlessSecurity);
+                    appendVlessParam(vlessParams, "encryption", vlessEncryption);
+                    appendVlessParam(vlessParams, "flow", vlessFlow);
+                    appendVlessParam(vlessParams, "sni", vlessSni);
+                    appendVlessParam(vlessParams, "fp", vlessFp);
+                    appendVlessParam(vlessParams, "alpn", vlessAlpn);
+                    appendVlessParam(vlessParams, "host", vlessHost);
+                    appendVlessParam(vlessParams, "path", vlessPath);
+                    appendVlessParam(vlessParams, "serviceName", vlessServiceName);
+                    appendVlessParam(vlessParams, "mode", vlessMode);
+                    appendVlessParam(vlessParams, "headerType", vlessHeaderType);
+                    appendVlessParam(vlessParams, "seed", vlessSeed);
+                    appendVlessParam(vlessParams, "quicSecurity", vlessQuicSecurity);
+                    appendVlessParam(vlessParams, "key", vlessQuicKey);
+                    appendVlessParam(vlessParams, "pbk", vlessPbk);
+                    appendVlessParam(vlessParams, "sid", vlessSid);
+                    appendVlessParam(vlessParams, "spx", vlessSpx);
+                    if (!TextUtils.isEmpty(vlessAllowInsecure)) {
+                        appendVlessParam(vlessParams, "allowInsecure", vlessAllowInsecure);
+                    }
+                    if (!vlessParams.isEmpty()) {
+                        vless.append("?").append(TextUtils.join("&", vlessParams));
+                    }
+                    url = url + vless.toString();
                 } else if (currentType == TYPE_MTPROTO) {
                     url = "https://t.me/proxy?";
                     if (params.length() != 0) {
@@ -669,15 +907,53 @@ public class ProxySettingsActivity extends BaseFragment {
             } catch (Exception ignore) {
                 return;
             }
-            if (params.length() == 0) {
-                return;
+            String link;
+            if (currentType == TYPE_XRAY_VLESS) {
+                link = url;
+            } else {
+                if (params.length() == 0) {
+                    return;
+                }
+                link = url + params.toString();
             }
-            String link = url + params.toString();
             QRCodeBottomSheet alert = new QRCodeBottomSheet(context, LocaleController.getString(R.string.ShareQrCode), link, LocaleController.getString(R.string.QRCodeLinkHelpProxy), true);
             Bitmap icon = SvgHelper.getBitmap(AndroidUtilities.readRes(R.raw.qr_dog), AndroidUtilities.dp(60), AndroidUtilities.dp(60), false);
             alert.setCenterImage(icon);
             showDialog(alert);
         });
+
+        redownloadCell = new TextSettingsCell(context);
+        redownloadCell.setBackgroundDrawable(Theme.getSelectorDrawable(true));
+        redownloadCell.setText(LocaleController.getString(R.string.XrayProxyRedownload), false);
+        redownloadCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlueText4));
+        redownloadCell.setVisibility(View.GONE);
+        linearLayout2.addView(redownloadCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
+        redownloadCell.setOnClickListener(v -> {
+            if (currentType != TYPE_XRAY_VLESS) {
+                return;
+            }
+            boolean deleted = XrayProxyManager.deleteCoreFiles();
+            if (getParentActivity() != null) {
+                if (deleted) {
+                    Toast.makeText(getParentActivity(), LocaleController.getString(R.string.XrayProxyRedownloaded), Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(getParentActivity(), LocaleController.getString(R.string.XrayProxyRedownloadFailed), Toast.LENGTH_SHORT).show();
+                }
+            }
+            SharedPreferences preferences = MessagesController.getGlobalMainSettings();
+            boolean enabled = preferences.getBoolean("proxy_enabled", false);
+            if (enabled && SharedConfig.currentProxy != null && SharedConfig.currentProxy.proxyType == SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+                XrayProxyManager.startService();
+                ConnectionsManager.setProxySettings(true, "", 0, "", "", "");
+            }
+        });
+
+        xrayStatusCell = new TextSettingsCell(context);
+        xrayStatusCell.setBackgroundDrawable(Theme.getSelectorDrawable(true));
+        xrayStatusCell.setTextColor(Theme.getColor(Theme.key_windowBackgroundWhiteBlackText));
+        xrayStatusCell.setVisibility(View.GONE);
+        xrayStatusCell.setEnabled(false);
+        linearLayout2.addView(xrayStatusCell, LayoutHelper.createLinear(LayoutHelper.MATCH_PARENT, LayoutHelper.WRAP_CONTENT));
 
         sectionCell[1] = new ShadowSectionCell(context);
         sectionCell[1].setBackgroundDrawable(Theme.getThemedDrawableByKey(context, R.drawable.greydivider_bottom, Theme.key_windowBackgroundGrayShadow));
@@ -690,7 +966,15 @@ public class ProxySettingsActivity extends BaseFragment {
         checkShareDone(false);
 
         currentType = -1;
-        setProxyType(initialType == TYPE_WSS ? TYPE_WSS : TextUtils.isEmpty(currentProxyInfo.secret) ? TYPE_SOCKS5 : TYPE_MTPROTO, false);
+        int initialProxyType;
+        if (currentProxyInfo.proxyType == SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+            initialProxyType = TYPE_XRAY_VLESS;
+        } else if (initialType == TYPE_WSS) {
+            initialProxyType = TYPE_WSS;
+        } else {
+            initialProxyType = TextUtils.isEmpty(currentProxyInfo.secret) ? TYPE_SOCKS5 : TYPE_MTPROTO;
+        }
+        setProxyType(initialProxyType, false);
 
         pasteType = -1;
         pasteString = null;
@@ -704,7 +988,7 @@ public class ProxySettingsActivity extends BaseFragment {
     }
 
     private void applyParsedProxyLink(ProxyLinkHelper.ProxyLink parsedProxyLink, boolean animated) {
-        if (parsedProxyLink == null || proxyTypeLocked && parsedProxyLink.type != initialType) {
+        if (parsedProxyLink == null || (proxyTypeLocked && parsedProxyLink.type != initialType)) {
             return;
         }
         setProxyType(parsedProxyLink.type, animated, () -> AndroidUtilities.hideKeyboard(inputFieldsContainer.findFocus()));
@@ -761,10 +1045,102 @@ public class ProxySettingsActivity extends BaseFragment {
         pasteType = -1;
         pasteString = clipText;
         pasteProxyLink = null;
-        ProxyLinkHelper.ProxyLink parsedProxyLink = parseProxyLink(clipText);
-        if (parsedProxyLink != null) {
-            pasteType = parsedProxyLink.type;
-            pasteProxyLink = parsedProxyLink;
+        pasteFields = null;
+
+        if (clipText != null) {
+            ProxyLinkHelper.ProxyLink parsedProxyLink = parseProxyLink(clipText);
+            if (parsedProxyLink != null) {
+                pasteType = parsedProxyLink.type;
+                pasteProxyLink = parsedProxyLink;
+            } else {
+                String[] params = null;
+                final String[] socksStrings = {"t.me/socks?", "tg://socks?"};
+                for (int i = 0; i < socksStrings.length; i++) {
+                    final int index = clipText.indexOf(socksStrings[i]);
+                    if (index >= 0) {
+                        pasteType = TYPE_SOCKS5;
+                        params = clipText.substring(index + socksStrings[i].length()).split("&");
+                        break;
+                    }
+                }
+
+                if (params == null) {
+                    final String[] proxyStrings = {"t.me/proxy?", "tg://proxy?"};
+                    for (int i = 0; i < proxyStrings.length; i++) {
+                        final int index = clipText.indexOf(proxyStrings[i]);
+                        if (index >= 0) {
+                            pasteType = TYPE_MTPROTO;
+                            params = clipText.substring(index + proxyStrings[i].length()).split("&");
+                            break;
+                        }
+                    }
+                }
+
+                if (params != null) {
+                    pasteFields = new String[inputFields.length];
+                    for (int i = 0; i < params.length; i++) {
+                        final String[] pair = params[i].split("=");
+                        if (pair.length != 2) continue;
+                        switch (pair[0].toLowerCase()) {
+                            case "server":
+                                pasteFields[FIELD_IP] = pair[1];
+                                break;
+                            case "port":
+                                pasteFields[FIELD_PORT] = pair[1];
+                                break;
+                            case "user":
+                                if (pasteType == TYPE_SOCKS5) {
+                                    pasteFields[FIELD_USER] = pair[1];
+                                }
+                                break;
+                            case "pass":
+                                if (pasteType == TYPE_SOCKS5) {
+                                    pasteFields[FIELD_PASSWORD] = pair[1];
+                                }
+                                break;
+                            case "secret":
+                                if (pasteType == TYPE_MTPROTO) {
+                                    pasteFields[FIELD_SECRET] = pair[1];
+                                }
+                                break;
+                        }
+                    }
+                } else {
+                    int index = clipText.indexOf("vless://");
+                    if (index >= 0) {
+                        pasteType = TYPE_XRAY_VLESS;
+                        String link = clipText.substring(index).split("\\s")[0];
+                        try {
+                            SharedConfig.ProxyInfo info = SharedConfig.ProxyInfo.fromUrl(link);
+                            pasteFields = new String[inputFields.length];
+                            pasteFields[FIELD_IP] = info.address;
+                            pasteFields[FIELD_PORT] = String.valueOf(info.port);
+                            pasteFields[FIELD_VLESS_ID] = info.vlessId;
+                            pasteFields[FIELD_VLESS_ENCRYPTION] = info.vlessEncryption;
+                            pasteFields[FIELD_VLESS_FLOW] = info.vlessFlow;
+                            pasteFields[FIELD_VLESS_SECURITY] = info.vlessSecurity;
+                            pasteFields[FIELD_VLESS_TRANSPORT] = info.vlessType;
+                            pasteFields[FIELD_VLESS_SNI] = info.vlessSni;
+                            pasteFields[FIELD_VLESS_HOST] = info.vlessHost;
+                            pasteFields[FIELD_VLESS_PATH] = info.vlessPath;
+                            pasteFields[FIELD_VLESS_SERVICE] = info.vlessServiceName;
+                            pasteFields[FIELD_VLESS_FP] = info.vlessFp;
+                            pasteFields[FIELD_VLESS_ALPN] = info.vlessAlpn;
+                            pasteFields[FIELD_VLESS_PBK] = info.vlessPublicKey;
+                            pasteFields[FIELD_VLESS_SID] = info.vlessShortId;
+                            pasteFields[FIELD_VLESS_SPX] = info.vlessSpiderX;
+                            pasteFields[FIELD_VLESS_HEADER_TYPE] = info.vlessHeaderType;
+                            pasteFields[FIELD_VLESS_SEED] = info.vlessSeed;
+                            pasteFields[FIELD_VLESS_QUIC_SECURITY] = info.vlessQuicSecurity;
+                            pasteFields[FIELD_VLESS_QUIC_KEY] = info.vlessQuicKey;
+                            pasteFields[FIELD_VLESS_MODE] = info.vlessMode;
+                            pasteFields[FIELD_VLESS_ALLOW_INSECURE] = info.vlessAllowInsecure ? "1" : "";
+                        } catch (Exception ignore) {
+                            pasteType = -1;
+                        }
+                    }
+                }
+            }
         }
 
         if (proxyTypeLocked && pasteType != initialType) {
@@ -781,6 +1157,13 @@ public class ProxySettingsActivity extends BaseFragment {
                 sectionCell[2].setVisibility(View.GONE);
             }
         }
+    }
+
+    private static void appendVlessParam(ArrayList<String> params, String key, String value) throws UnsupportedEncodingException {
+        if (TextUtils.isEmpty(value)) {
+            return;
+        }
+        params.add(URLEncoder.encode(key, "UTF-8") + "=" + URLEncoder.encode(value, "UTF-8"));
     }
 
     private void setShareDoneEnabled(boolean enabled, boolean animated) {
@@ -815,8 +1198,43 @@ public class ProxySettingsActivity extends BaseFragment {
         if (shareCell == null || doneItem == null || inputFields[FIELD_IP] == null || inputFields[FIELD_WSS_HOST] == null || inputFields[FIELD_PORT] == null) {
             return;
         }
-        EditTextBoldCursor addressField = currentType == TYPE_WSS ? inputFields[FIELD_WSS_HOST] : inputFields[FIELD_IP];
-        setShareDoneEnabled(addressField.length() != 0 && Utilities.parseInt(inputFields[FIELD_PORT].getText().toString()) != 0, animated);
+        boolean valid;
+        if (currentType == TYPE_WSS) {
+            valid = inputFields[FIELD_WSS_HOST].length() != 0 && Utilities.parseInt(inputFields[FIELD_PORT].getText().toString()) != 0;
+        } else if (currentType == TYPE_XRAY_VLESS) {
+            valid = inputFields[FIELD_IP].length() != 0 && Utilities.parseInt(inputFields[FIELD_PORT].getText().toString()) != 0 && inputFields[FIELD_VLESS_ID].length() != 0;
+        } else {
+            valid = inputFields[FIELD_IP].length() != 0 && Utilities.parseInt(inputFields[FIELD_PORT].getText().toString()) != 0;
+        }
+        setShareDoneEnabled(valid, animated);
+    }
+
+    private void updateXrayStatusCell() {
+        if (xrayStatusCell == null || currentType != TYPE_XRAY_VLESS) {
+            return;
+        }
+        String title = LocaleController.getString(R.string.XrayProxyCoreStatus);
+        String value;
+        int state = XrayProxyManager.getState();
+        if (state == XrayProxyManager.STATE_RUNNING) {
+            value = LocaleController.getString(R.string.XrayProxyStatusReady);
+        } else if (state == XrayProxyManager.STATE_STARTING) {
+            value = LocaleController.getString(R.string.XrayProxyStatusStarting);
+        } else if (state == XrayProxyManager.STATE_DOWNLOADING) {
+            long total = XrayProxyManager.getDownloadTotalBytes();
+            long current = XrayProxyManager.getDownloadBytes();
+            if (total > 0) {
+                int percent = (int) Math.min(100, (current * 100) / total);
+                value = LocaleController.formatString(R.string.XrayProxyStatusDownloadingPercent, percent);
+            } else {
+                value = LocaleController.getString(R.string.XrayProxyStatusDownloading);
+            }
+        } else if (state == XrayProxyManager.STATE_FAILED) {
+            value = LocaleController.getString(R.string.XrayProxyStatusFailed);
+        } else {
+            value = LocaleController.getString(R.string.XrayProxyStatusIdle);
+        }
+        xrayStatusCell.setTextAndValue(title, value, false);
     }
 
     private void setProxyType(int type, boolean animated) {
@@ -843,59 +1261,84 @@ public class ProxySettingsActivity extends BaseFragment {
                 if (onTransitionEnd != null) {
                     transitionSet.addListener(new Transition.TransitionListener() {
                         @Override
-                        public void onTransitionStart(Transition transition) {
-                        }
-
+                        public void onTransitionStart(Transition transition) {}
                         @Override
                         public void onTransitionEnd(Transition transition) {
                             onTransitionEnd.run();
                         }
-
                         @Override
-                        public void onTransitionCancel(Transition transition) {
-                        }
-
+                        public void onTransitionCancel(Transition transition) {}
                         @Override
-                        public void onTransitionPause(Transition transition) {
-                        }
-
+                        public void onTransitionPause(Transition transition) {}
                         @Override
-                        public void onTransitionResume(Transition transition) {
-                        }
+                        public void onTransitionResume(Transition transition) {}
                     });
                 }
 
                 TransitionManager.beginDelayedTransition(linearLayout2, transitionSet);
             }
-            ((View) inputFields[FIELD_IP].getParent()).setVisibility(currentType == TYPE_WSS ? View.GONE : View.VISIBLE);
-            ((View) inputFields[FIELD_PORT].getParent()).setVisibility(View.VISIBLE);
-            ((View) inputFields[FIELD_WSS_HOST].getParent()).setVisibility(currentType == TYPE_WSS ? View.VISIBLE : View.GONE);
-            ((View) inputFields[FIELD_WSS_PATH].getParent()).setVisibility(currentType == TYPE_WSS ? View.VISIBLE : View.GONE);
-            bottomCells[2].setVisibility(currentType == TYPE_WSS ? View.VISIBLE : View.GONE);
-            if (currentType == TYPE_SOCKS5) {
-                bottomCells[0].setVisibility(View.VISIBLE);
-                bottomCells[1].setVisibility(View.GONE);
-                ((View) inputFields[FIELD_SECRET].getParent()).setVisibility(View.GONE);
-                ((View) inputFields[FIELD_PASSWORD].getParent()).setVisibility(View.VISIBLE);
-                ((View) inputFields[FIELD_USER].getParent()).setVisibility(View.VISIBLE);
-            } else if (currentType == TYPE_MTPROTO) {
-                bottomCells[0].setVisibility(View.GONE);
-                bottomCells[1].setVisibility(View.VISIBLE);
-                ((View) inputFields[FIELD_SECRET].getParent()).setVisibility(View.VISIBLE);
-                ((View) inputFields[FIELD_PASSWORD].getParent()).setVisibility(View.GONE);
-                ((View) inputFields[FIELD_USER].getParent()).setVisibility(View.GONE);
-            } else if (currentType == TYPE_WSS) {
-                bottomCells[0].setVisibility(View.GONE);
-                bottomCells[1].setVisibility(View.GONE);
-                ((View) inputFields[FIELD_SECRET].getParent()).setVisibility(View.GONE);
-                ((View) inputFields[FIELD_PASSWORD].getParent()).setVisibility(View.GONE);
-                ((View) inputFields[FIELD_USER].getParent()).setVisibility(View.GONE);
-            }
+
+            boolean isSocks = currentType == TYPE_SOCKS5;
+            boolean isMtproto = currentType == TYPE_MTPROTO;
+            boolean isWss = currentType == TYPE_WSS;
+            boolean isVless = currentType == TYPE_XRAY_VLESS;
+
+            setFieldVisible(FIELD_IP, !isWss);
+            setFieldVisible(FIELD_PORT, true);
+            setFieldVisible(FIELD_WSS_HOST, isWss);
+            setFieldVisible(FIELD_WSS_PATH, isWss);
+
+            bottomCells[0].setVisibility(isSocks ? View.VISIBLE : View.GONE);
+            bottomCells[1].setVisibility(isMtproto ? View.VISIBLE : View.GONE);
+            bottomCells[2].setVisibility(isWss ? View.VISIBLE : View.GONE);
+            bottomCells[3].setVisibility(isVless ? View.VISIBLE : View.GONE);
+
+            setFieldVisible(FIELD_SECRET, isMtproto);
+            setFieldVisible(FIELD_PASSWORD, isSocks);
+            setFieldVisible(FIELD_USER, isSocks);
+
+            setFieldVisible(FIELD_VLESS_ID, isVless);
+            setFieldVisible(FIELD_VLESS_ENCRYPTION, isVless);
+            setFieldVisible(FIELD_VLESS_FLOW, isVless);
+            setFieldVisible(FIELD_VLESS_SECURITY, isVless);
+            setFieldVisible(FIELD_VLESS_TRANSPORT, isVless);
+            setFieldVisible(FIELD_VLESS_SNI, isVless);
+            setFieldVisible(FIELD_VLESS_HOST, isVless);
+            setFieldVisible(FIELD_VLESS_PATH, isVless);
+            setFieldVisible(FIELD_VLESS_SERVICE, isVless);
+            setFieldVisible(FIELD_VLESS_FP, isVless);
+            setFieldVisible(FIELD_VLESS_ALPN, isVless);
+            setFieldVisible(FIELD_VLESS_PBK, isVless);
+            setFieldVisible(FIELD_VLESS_SID, isVless);
+            setFieldVisible(FIELD_VLESS_SPX, isVless);
+            setFieldVisible(FIELD_VLESS_HEADER_TYPE, isVless);
+            setFieldVisible(FIELD_VLESS_SEED, isVless);
+            setFieldVisible(FIELD_VLESS_QUIC_SECURITY, isVless);
+            setFieldVisible(FIELD_VLESS_QUIC_KEY, isVless);
+            setFieldVisible(FIELD_VLESS_MODE, isVless);
+            setFieldVisible(FIELD_VLESS_ALLOW_INSECURE, isVless);
+            setFieldVisible(FIELD_VLESS_ADVANCED_JSON, isVless);
+
             for (int i = 0; i < typeCell.length; i++) {
                 typeCell[i].setChecked(currentType == i, animated);
             }
+
+            if (redownloadCell != null) {
+                redownloadCell.setVisibility(isVless ? View.VISIBLE : View.GONE);
+            }
+            if (xrayStatusCell != null) {
+                xrayStatusCell.setVisibility(isVless ? View.VISIBLE : View.GONE);
+                if (isVless) {
+                    updateXrayStatusCell();
+                }
+            }
             checkShareDone(animated);
         }
+    }
+
+    private void setFieldVisible(int field, boolean visible) {
+        View container = (View) inputFields[field].getParent();
+        container.setVisibility(visible ? View.VISIBLE : View.GONE);
     }
 
     @Override
@@ -941,12 +1384,23 @@ public class ProxySettingsActivity extends BaseFragment {
 
         arrayList.add(new ThemeDescription(shareCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_windowBackgroundWhite));
         arrayList.add(new ThemeDescription(shareCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_listSelector));
-        arrayList.add(new ThemeDescription(null, 0, null, null, null, null, delegate, Theme.key_windowBackgroundWhiteBlueText4));
-        arrayList.add(new ThemeDescription(null, 0, null, null, null, null, delegate, Theme.key_windowBackgroundWhiteGrayText2));
+        arrayList.add(new ThemeDescription(null, 0, null, null, null, delegate, Theme.key_windowBackgroundWhiteBlueText4));
+        arrayList.add(new ThemeDescription(null, 0, null, null, null, delegate, Theme.key_windowBackgroundWhiteGrayText2));
 
         arrayList.add(new ThemeDescription(pasteCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_windowBackgroundWhite));
         arrayList.add(new ThemeDescription(pasteCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_listSelector));
         arrayList.add(new ThemeDescription(pasteCell, 0, new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlueText4));
+        if (redownloadCell != null) {
+            arrayList.add(new ThemeDescription(redownloadCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_windowBackgroundWhite));
+            arrayList.add(new ThemeDescription(redownloadCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_listSelector));
+            arrayList.add(new ThemeDescription(redownloadCell, 0, new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlueText4));
+        }
+        if (xrayStatusCell != null) {
+            arrayList.add(new ThemeDescription(xrayStatusCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_windowBackgroundWhite));
+            arrayList.add(new ThemeDescription(xrayStatusCell, ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_listSelector));
+            arrayList.add(new ThemeDescription(xrayStatusCell, 0, new Class[]{TextSettingsCell.class}, new String[]{"textView"}, null, null, null, Theme.key_windowBackgroundWhiteBlackText));
+            arrayList.add(new ThemeDescription(xrayStatusCell, 0, new Class[]{TextSettingsCell.class}, new String[]{"valueTextView"}, null, null, null, Theme.key_windowBackgroundWhiteValueText));
+        }
 
         for (int a = 0; a < typeCell.length; a++) {
             arrayList.add(new ThemeDescription(typeCell[a], ThemeDescription.FLAG_SELECTORWHITE, null, null, null, null, Theme.key_windowBackgroundWhite));

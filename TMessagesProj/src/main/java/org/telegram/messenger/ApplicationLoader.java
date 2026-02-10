@@ -358,6 +358,7 @@ public class ApplicationLoader extends Application {
 
         LauncherIconController.tryFixLauncherIconIfNeeded();
         ProxyRotationController.init();
+        XrayProxyManager.maybeStartFromApp();
     }
 
     public static void startPushService() {

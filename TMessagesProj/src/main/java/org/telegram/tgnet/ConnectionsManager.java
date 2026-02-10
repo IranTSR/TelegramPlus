@@ -48,6 +48,7 @@ import org.telegram.messenger.SharedConfig;
 import org.telegram.messenger.StatsController;
 import org.telegram.messenger.UserConfig;
 import org.telegram.messenger.Utilities;
+import org.telegram.messenger.XrayProxyManager;
 import org.telegram.ui.Components.VideoPlayer;
 import org.telegram.ui.LoginActivity;
 
@@ -209,6 +210,8 @@ public class ConnectionsManager extends BaseController {
     private static final String DNS_REASON_TIMEOUT = "timeout";
 
     private static long lastDnsRequestTime;
+    private static final Object xrayProxyLock = new Object();
+    private static boolean xrayProxyWaiting;
 
     public final static int DEFAULT_DATACENTER_ID = Integer.MAX_VALUE;
 
@@ -837,11 +840,33 @@ public class ConnectionsManager extends BaseController {
         String proxySecret = preferences.getString("proxy_secret", "");
         int proxyPort = preferences.getInt("proxy_port", 1080);
 
+        if (SharedConfig.currentProxy != null && SharedConfig.currentProxy.proxyType == SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+            XrayProxyManager.startService();
+            if (XrayProxyManager.isSocksReady()) {
+                native_setProxySettings(currentAccount, XrayProxyManager.LOCAL_ADDRESS, XrayProxyManager.getLocalSocksPort(), "", "", "");
+            } else {
+                scheduleXrayProxyApply();
+            }
+        } else {
+            native_setProxySettings(currentAccount, proxyAddress, proxyPort, proxyUsername, proxyPassword, proxySecret);
+        }
+
         if (preferences.getBoolean("proxy_enabled", false) && !TextUtils.isEmpty(proxyAddress)) {
             int activationGeneration = ProxyRuntimeStateStore.noteProxyStartupRestoreActivation(currentAccount);
-            native_setProxySettings(currentAccount, proxyAddress, proxyPort, proxyUsername, proxyPassword, proxySecret, MtProxyOptions.resolve(proxyAddress, proxyPort, proxySecret), activationGeneration, ProxyConnectionEvent.Origin.STARTUP_RESTORE.wireName);
+            if (SharedConfig.currentProxy != null && SharedConfig.currentProxy.proxyType == SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+                XrayProxyManager.startService();
+                if (XrayProxyManager.isSocksReady()) {
+                    native_setProxySettings(currentAccount, XrayProxyManager.LOCAL_ADDRESS, XrayProxyManager.getLocalSocksPort(), "", "", "", MtProxyOptions.disabled(), activationGeneration, ProxyConnectionEvent.Origin.STARTUP_RESTORE.wireName);
+                } else {
+                    scheduleXrayProxyApply();
+                }
+            } else {
+                native_setProxySettings(currentAccount, proxyAddress, proxyPort, proxyUsername, proxyPassword, proxySecret, MtProxyOptions.resolve(proxyAddress, proxyPort, proxySecret), activationGeneration, ProxyConnectionEvent.Origin.STARTUP_RESTORE.wireName);
+            }
         }
+
         setWssTransportSettings();
+
         String installer = "";
         try {
             Context context = ApplicationLoader.applicationContext;
@@ -857,7 +882,6 @@ public class ConnectionsManager extends BaseController {
                 installer = context.getPackageManager().getInstallerPackageName(context.getPackageName());
             }
         } catch (Throwable ignore) {
-
         }
         if (installer == null) {
             installer = "";
@@ -866,7 +890,6 @@ public class ConnectionsManager extends BaseController {
         try {
             packageId = ApplicationLoader.applicationContext.getPackageName();
         } catch (Throwable ignore) {
-
         }
         if (packageId == null) {
             packageId = "";
@@ -1078,7 +1101,6 @@ public class ConnectionsManager extends BaseController {
     public static void onUnparsedMessageReceived(long address, final int currentAccount, long messageId) {
         try {
             NativeByteBuffer buff = NativeByteBuffer.wrap(address);
-            buff.setDataSourceType(TLDataSourceType.NETWORK);
             buff.reused = true;
             int constructor = buff.readInt32(true);
             final TLObject message = TLClassStore.Instance().TLdeserialize(buff, constructor, true);
@@ -1120,8 +1142,6 @@ public class ConnectionsManager extends BaseController {
         onProxyConnectionStageChanged(currentAccount, diagnostic, endpointKey, "", origin);
     }
 
-    // UI-thread-confined (every write happens inside the runOnUIThread lambda below): last logged
-    // proxy_connection_stage per account, used to log only on an actual stage transition.
     private static final java.util.HashMap<Integer, String> lastLoggedProxyStage = new java.util.HashMap<>();
     private static final java.util.HashMap<Integer, String> lastLoggedProxyDiagnosis = new java.util.HashMap<>();
 
@@ -1137,9 +1157,6 @@ public class ConnectionsManager extends BaseController {
         onProxyConnectionStageChanged(currentAccount, diagnostic, endpointKey, probeKey, origin, socketRole, activationGeneration, 0);
     }
 
-    // Native callback (TgNetWrapper): suggestedHoldMs is the native retry
-    // authority's clock (endpoint cooldown / probe coordinator hold) riding
-    // along with the event, so the Java layer never re-derives hold windows.
     public static void onProxyConnectionStageChanged(final int currentAccount, final String diagnostic, final String endpointKey, final String probeKey, final String origin, final String socketRole, final int activationGeneration, final int suggestedHoldMs) {
         AndroidUtilities.runOnUIThread(() -> {
             ProxyConnectionEvent event = ProxyConnectionEvent.nativeStage(currentAccount, diagnostic, endpointKey, probeKey, origin, socketRole, activationGeneration, suggestedHoldMs, android.os.SystemClock.elapsedRealtime());
@@ -1157,9 +1174,6 @@ public class ConnectionsManager extends BaseController {
                 return;
             }
             if (BuildVars.LOGS_ENABLED) {
-                // The native side fires this callback on every transport state change (thousands/sec
-                // during a reconnect storm); logging each one was the bulk of the main-log spam. Only
-                // distinct transitions carry diagnostic value, so log on change of (phase, endpoint, probe).
                 String stageKey = normalizedDiagnostic + "|" + endpointKey + "|" + event.origin.wireName + "|" + event.socketRole.wireName + "|" + event.probeKey + "|" + event.activationGeneration;
                 if (!stageKey.equals(lastLoggedProxyStage.get(currentAccount))) {
                     lastLoggedProxyStage.put(currentAccount, stageKey);
@@ -1405,9 +1419,31 @@ public class ConnectionsManager extends BaseController {
             secret = "";
         }
 
+        if (enabled && SharedConfig.currentProxy != null && SharedConfig.currentProxy.proxyType == SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+            XrayProxyManager.startService();
+            if (XrayProxyManager.isSocksReady()) {
+                address = XrayProxyManager.LOCAL_ADDRESS;
+                port = XrayProxyManager.getLocalSocksPort();
+                username = "";
+                password = "";
+                secret = "";
+            } else {
+                scheduleXrayProxyApply();
+                enabled = false;
+                address = "";
+                port = 0;
+                username = "";
+                password = "";
+                secret = "";
+            }
+        } else if (!enabled && SharedConfig.currentProxy != null && SharedConfig.currentProxy.proxyType == SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+            XrayProxyManager.stopService();
+        }
+
         ProxyConnectionEvent.Origin activationOrigin = origin == null ? ProxyConnectionEvent.Origin.SETTINGS_CHANGE : origin;
         int activationGeneration = ProxyRuntimeStateStore.noteProxySettingsActivation(activationOrigin);
         MtProxyOptions enabledOptions = enabled && !TextUtils.isEmpty(address) ? MtProxyOptions.resolve(address, port, secret) : MtProxyOptions.disabled();
+
         for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
             if (enabled && !TextUtils.isEmpty(address)) {
                 native_setProxySettings(a, address, port, username, password, secret, enabledOptions, activationGeneration, activationOrigin.wireName);
@@ -1589,6 +1625,36 @@ public class ConnectionsManager extends BaseController {
             hash *= 0x100000001b3L;
         }
         return hash;
+    }
+
+    private static void scheduleXrayProxyApply() {
+        synchronized (xrayProxyLock) {
+            if (xrayProxyWaiting) {
+                return;
+            }
+            xrayProxyWaiting = true;
+        }
+        Utilities.globalQueue.postRunnable(() -> {
+            try {
+                boolean ready = XrayProxyManager.waitForSocksReady(180_000);
+                if (!ready) {
+                    return;
+                }
+                SharedConfig.loadProxyList();
+                SharedPreferences preferences = ApplicationLoader.applicationContext.getSharedPreferences("mainconfig", Activity.MODE_PRIVATE);
+                if (!preferences.getBoolean("proxy_enabled", false)) {
+                    return;
+                }
+                if (SharedConfig.currentProxy == null || SharedConfig.currentProxy.proxyType != SharedConfig.ProxyInfo.PROXY_TYPE_XRAY_VLESS) {
+                    return;
+                }
+                setProxySettings(true, "", 0, "", "", "");
+            } finally {
+                synchronized (xrayProxyLock) {
+                    xrayProxyWaiting = false;
+                }
+            }
+        });
     }
 
     public static native void native_switchBackend(int currentAccount, boolean restart);
@@ -2282,10 +2348,10 @@ public class ConnectionsManager extends BaseController {
         }
     }
 
-    private static class GoogleJsonDohResolver implements HostResolver {
+    private static class GoogleDnsResolver implements HostResolver {
         @Override
         public ResolvedDomain resolve(String host, int type, ResolveContext context) throws Exception {
-            return resolveDohAddress(context, name(), DOH_GOOGLE_QUERY_ENDPOINT, type, dohQueryParam("edns_client_subnet", "0.0.0.0/0"));
+            return resolveDohAddress(context, "google_json_doh", DOH_GOOGLE_QUERY_ENDPOINT, type, null);
         }
 
         @Override
@@ -2294,10 +2360,10 @@ public class ConnectionsManager extends BaseController {
         }
     }
 
-    private static class CloudflareJsonDohResolver implements HostResolver {
+    private static class CloudflareDnsResolver implements HostResolver {
         @Override
         public ResolvedDomain resolve(String host, int type, ResolveContext context) throws Exception {
-            return resolveDohAddress(context, name(), DOH_CLOUDFLARE_QUERY_ENDPOINT, type, "");
+            return resolveDohAddress(context, "cloudflare_json_doh", DOH_CLOUDFLARE_QUERY_ENDPOINT, type, null);
         }
 
         @Override
@@ -2306,359 +2372,135 @@ public class ConnectionsManager extends BaseController {
         }
     }
 
-    private static final HostResolver[] HOST_RESOLVER_CHAIN = new HostResolver[] {
+    private static final HostResolver[] HOST_RESOLVER_CHAIN = {
             new DnsCacheResolver(),
             new SystemDnsResolver(),
-            new GoogleJsonDohResolver(),
-            new CloudflareJsonDohResolver()
+            new GoogleDnsResolver(),
+            new CloudflareDnsResolver()
     };
 
-    private static String randomDohPadding() {
-        int len = Utilities.random.nextInt(116) + 13;
-        final String characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-        StringBuilder padding = new StringBuilder(len);
-        for (int a = 0; a < len; a++) {
-            padding.append(characters.charAt(Utilities.random.nextInt(characters.length())));
+    private static class ResolveHostByNameTask extends AsyncTask<Void, Void, ResolvedDomain> {
+        final String host;
+        final List<Long> addresses = new ArrayList<>();
+        final int generation;
+
+        ResolveHostByNameTask(String host) {
+            this.host = host;
+            this.generation = dnsResolveGeneration.get();
         }
-        return padding.toString();
+
+        void addAddress(long address) {
+            addresses.add(address);
+        }
+
+        @Override
+        protected ResolvedDomain doInBackground(Void... params) {
+            return resolveHost(host, 1, new ResolveContext(host, false, SystemClock.elapsedRealtime(), generation, HOST_RESOLVER_TOTAL_TIMEOUT_MS), this);
+        }
+
+        @Override
+        protected void onPostExecute(ResolvedDomain result) {
+            long now = SystemClock.elapsedRealtime();
+            if (result != null && result.isFresh(now)) {
+                synchronized (dnsCache) {
+                    dnsCache.put(host, result);
+                }
+                for (long address : addresses) {
+                    native_onHostNameResolved(host, address, result.getAddress());
+                }
+            } else if (result != null && result.isStale(now)) {
+                //’stale’ result is already handled in resolveHost and passed to native
+            } else {
+                for (long address : addresses) {
+                    native_onHostNameResolved(host, address, "");
+                }
+            }
+            resolvingHostnameTasks.remove(host);
+        }
     }
 
-    private static String dnsConfigDomain(int currentAccount) {
-        if (native_isTestBackend(currentAccount) != 0) {
-            return "tapv3.stel.com";
+    private static class GoogleDnsLoadTask extends ResolveHostByNameTask {
+        GoogleDnsLoadTask(int currentAccount) {
+            super(SharedConfig.dnsQueryHost);
         }
-        return AccountInstance.getInstance(currentAccount).getMessagesController().dcDomainName;
+
+        @Override
+        protected void onPostExecute(ResolvedDomain result) {
+            super.onPostExecute(result);
+            if (result != null) {
+                native_onDnsResolved(currentAccount, 1);
+            } else {
+                native_onDnsResolved(currentAccount, 0);
+            }
+        }
     }
 
-    private static NativeByteBuffer parseDnsTxtConfig(byte[] bytes) throws Exception {
-        JSONObject jsonObject = new JSONObject(new String(bytes));
-        JSONArray array = jsonObject.getJSONArray("Answer");
-        int len = array.length();
-        ArrayList<String> arrayList = new ArrayList<>(len);
-        for (int a = 0; a < len; a++) {
-            JSONObject object = array.getJSONObject(a);
-            int type = object.getInt("type");
-            if (type != 16) {
-                continue;
-            }
-            arrayList.add(object.getString("data"));
+    private static class CloudflareDnsLoadTask extends ResolveHostByNameTask {
+        CloudflareDnsLoadTask(int currentAccount) {
+            super(SharedConfig.dnsQueryHost);
         }
-        Collections.sort(arrayList, (o1, o2) -> {
-            int l1 = o1.length();
-            int l2 = o2.length();
-            if (l1 > l2) {
-                return -1;
-            } else if (l1 < l2) {
-                return 1;
+
+        @Override
+        protected void onPostExecute(ResolvedDomain result) {
+            super.onPostExecute(result);
+            if (result != null) {
+                native_onDnsResolved(currentAccount, 1);
+            } else {
+                native_onDnsResolved(currentAccount, 0);
             }
-            return 0;
-        });
-        StringBuilder builder = new StringBuilder();
-        for (int a = 0; a < arrayList.size(); a++) {
-            builder.append(arrayList.get(a).replace("\"", ""));
         }
-        byte[] decodedBytes = Base64.decode(builder.toString(), Base64.DEFAULT);
-        NativeByteBuffer buffer = new NativeByteBuffer(decodedBytes.length);
-        buffer.writeBytes(decodedBytes);
-        return buffer;
+    }
+
+    private static class FirebaseTask extends AsyncTask<Void, Void, ResolvedDomain> {
+        final int currentAccount;
+
+        FirebaseTask(int currentAccount) {
+            this.currentAccount = currentAccount;
+        }
+
+        @Override
+        protected ResolvedDomain doInBackground(Void... params) {
+            try {
+                return resolveFirebaseTask();
+            } catch (Exception e) {
+                FileLog.e(e);
+                return null;
+            }
+        }
+
+        private ResolvedDomain resolveFirebaseTask() throws Exception {
+            String host = SharedConfig.firebaseDnsHost;
+            if (TextUtils.isEmpty(host)) {
+                return null;
+            }
+            return resolveHost(host, 1, new ResolveContext(host, false, SystemClock.elapsedRealtime(), dnsResolveGeneration.get(), HOST_RESOLVER_TOTAL_TIMEOUT_MS), this);
+        }
+
+        @Override
+        protected void onPostExecute(ResolvedDomain result) {
+            if (result != null) {
+                native_onDnsResolved(currentAccount, 1);
+            } else {
+                native_onDnsResolved(currentAccount, 0);
+            }
+        }
     }
 
     private static class DohJsonResponse {
         final byte[] bytes;
-        final int responseDate;
+        final int timestamp;
 
-        DohJsonResponse(byte[] bytes, int responseDate) {
+        DohJsonResponse(byte[] bytes, int timestamp) {
             this.bytes = bytes;
-            this.responseDate = responseDate;
+            this.timestamp = timestamp;
         }
     }
 
-    private static class ResolveHostByNameTask extends AsyncTask<Void, Void, ResolvedDomain> {
-
-        private ArrayList<Long> addresses = new ArrayList<>();
-        private String currentHostName;
-        private boolean blockedZeroAddress;
-
-        public ResolveHostByNameTask(String hostName) {
-            super();
-            currentHostName = hostName;
-        }
-
-        public void addAddress(long address) {
-            if (addresses.contains(address)) {
-                return;
-            }
-            addresses.add(address);
-        }
-
-        protected ResolvedDomain doInBackground(Void... voids) {
-            ResolveContext context = new ResolveContext(currentHostName, false, SystemClock.elapsedRealtime(), dnsResolveGeneration.getAndIncrement(), HOST_RESOLVER_TOTAL_TIMEOUT_MS);
-            ResolvedDomain result = resolveHost(currentHostName, DnsResolver.TYPE_A, context, this);
-            blockedZeroAddress = context.blockedZeroAddress();
-            return result;
-        }
-
-        @Override
-        protected void onPostExecute(final ResolvedDomain result) {
-            if (result != null) {
-                clearNegativeDnsCache(currentHostName);
-                synchronized (dnsCache) {
-                    dnsCache.put(currentHostName, result);
-                }
-                for (int a = 0, N = addresses.size(); a < N; a++) {
-                    native_onHostNameResolved(currentHostName, addresses.get(a), result.getAddress());
-                }
-            } else {
-                for (int a = 0, N = addresses.size(); a < N; a++) {
-                    native_onHostNameResolved(currentHostName, addresses.get(a), blockedZeroAddress ? DNS_BLOCKED_ZERO_NATIVE_SENTINEL : "");
-                }
-            }
-            resolvingHostnameTasks.remove(currentHostName);
-        }
+    public static void onIntegrityCheckClassic(int currentAccount, int requestToken, String nonce, String token) {
+        native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, token);
     }
 
-    private static class GoogleDnsLoadTask extends AsyncTask<Void, Void, NativeByteBuffer> {
-
-        private int currentAccount;
-        private int responseDate;
-
-        public GoogleDnsLoadTask(int instance) {
-            super();
-            currentAccount = instance;
-        }
-
-        protected NativeByteBuffer doInBackground(Void... voids) {
-            String domain = "";
-            try {
-                domain = dnsConfigDomain(currentAccount);
-                DohJsonResponse response = loadDohJson(DOH_GOOGLE_QUERY_ENDPOINT, domain, "ANY", dohQueryParam("random_padding", randomDohPadding()), 5000, 5000, this);
-                responseDate = response.responseDate;
-                return parseDnsTxtConfig(response.bytes);
-            } catch (FileNotFoundException | UnknownHostException | SocketTimeoutException | SSLException e) {
-                logDohExpectedFailure("google_txt", domain, DOH_GOOGLE_QUERY_ENDPOINT, e);
-            } catch (Throwable e) {
-                FileLog.e(e, false);
-            }
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(final NativeByteBuffer result) {
-            Utilities.stageQueue.postRunnable(() -> {
-                FileLog.d("3. currentTask = null, result = " + result);
-                currentTask = null;
-                if (result != null) {
-                    native_applyDnsConfig(currentAccount, result.address, AccountInstance.getInstance(currentAccount).getUserConfig().getClientPhone(), responseDate);
-                } else {
-                    if (BuildVars.LOGS_ENABLED) {
-                        FileLog.d("failed to get google result");
-                        FileLog.d("start cloudflare task");
-                    }
-                    CloudflareDnsLoadTask task = new CloudflareDnsLoadTask(currentAccount);
-                    task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);
-                    FileLog.d("4. currentTask = cloudflare");
-                    currentTask = task;
-                }
-            });
-        }
-    }
-
-    private static class CloudflareDnsLoadTask extends AsyncTask<Void, Void, NativeByteBuffer> {
-
-        private int currentAccount;
-        private int responseDate;
-
-        public CloudflareDnsLoadTask(int instance) {
-            super();
-            currentAccount = instance;
-        }
-
-        protected NativeByteBuffer doInBackground(Void... voids) {
-            String domain = "";
-            try {
-                domain = dnsConfigDomain(currentAccount);
-                DohJsonResponse response = loadDohJson(DOH_CLOUDFLARE_QUERY_ENDPOINT, domain, "TXT", dohQueryParam("random_padding", randomDohPadding()), 5000, 5000, this);
-                responseDate = response.responseDate;
-                return parseDnsTxtConfig(response.bytes);
-            } catch (FileNotFoundException | UnknownHostException | SocketTimeoutException | SSLException e) {
-                logDohExpectedFailure("cloudflare_txt", domain, DOH_CLOUDFLARE_QUERY_ENDPOINT, e);
-            } catch (Throwable e) {
-                FileLog.e(e, false);
-            }
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(final NativeByteBuffer result) {
-            Utilities.stageQueue.postRunnable(() -> {
-                FileLog.d("5. currentTask = null");
-                currentTask = null;
-                if (result != null) {
-                    native_applyDnsConfig(currentAccount, result.address, AccountInstance.getInstance(currentAccount).getUserConfig().getClientPhone(), responseDate);
-                } else {
-                    if (BuildVars.LOGS_ENABLED) {
-                        FileLog.d("failed to get cloudflare txt result");
-                    }
-                }
-            });
-        }
-    }
-
-    private static class FirebaseTask extends AsyncTask<Void, Void, NativeByteBuffer> {
-
-        private int currentAccount;
-        private FirebaseRemoteConfig firebaseRemoteConfig;
-
-        public FirebaseTask(int instance) {
-            super();
-            currentAccount = instance;
-        }
-
-        protected NativeByteBuffer doInBackground(Void... voids) {
-            try {
-                if (native_isTestBackend(currentAccount) != 0) {
-                    throw new Exception("test backend");
-                }
-                firebaseRemoteConfig = FirebaseRemoteConfig.getInstance();
-                String currentValue = firebaseRemoteConfig.getString("ipconfigv3");
-                if (BuildVars.LOGS_ENABLED) {
-                    FileLog.d("current firebase value = " + currentValue);
-                }
-
-                firebaseRemoteConfig.fetch(0).addOnCompleteListener(finishedTask -> {
-                    final boolean success = finishedTask.isSuccessful();
-                    Utilities.stageQueue.postRunnable(() -> {
-                        if (success) {
-                            firebaseRemoteConfig.activate().addOnCompleteListener(finishedTask2 -> {
-                                FileLog.d("6. currentTask = null");
-                                currentTask = null;
-                                String config = firebaseRemoteConfig.getString("ipconfigv3");
-                                if (!TextUtils.isEmpty(config)) {
-                                    byte[] bytes = Base64.decode(config, Base64.DEFAULT);
-                                    try {
-                                        NativeByteBuffer buffer = new NativeByteBuffer(bytes.length);
-                                        buffer.writeBytes(bytes);
-                                        int date = (int) (firebaseRemoteConfig.getInfo().getFetchTimeMillis() / 1000);
-                                        native_applyDnsConfig(currentAccount, buffer.address, AccountInstance.getInstance(currentAccount).getUserConfig().getClientPhone(), date);
-                                    } catch (Exception e) {
-                                        FileLog.e(e);
-                                    }
-                                } else {
-                                    if (BuildVars.LOGS_ENABLED) {
-                                        FileLog.d("failed to get firebase result");
-                                        FileLog.d("start dns txt task");
-                                    }
-                                    GoogleDnsLoadTask task = new GoogleDnsLoadTask(currentAccount);
-                                    task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);
-                                    FileLog.d("7. currentTask = GoogleDnsLoadTask");
-                                    currentTask = task;
-                                }
-                            });
-                        } else {
-                            if (BuildVars.LOGS_ENABLED) {
-                                FileLog.d("failed to get firebase result 2");
-                                FileLog.d("start dns txt task");
-                            }
-                            GoogleDnsLoadTask task = new GoogleDnsLoadTask(currentAccount);
-                            task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);
-                            FileLog.d("7. currentTask = GoogleDnsLoadTask");
-                            currentTask = task;
-                        }
-                    });
-                });
-            } catch (Throwable e) {
-                Utilities.stageQueue.postRunnable(() -> {
-                    if (BuildVars.LOGS_ENABLED) {
-                        FileLog.d("failed to get firebase result");
-                        FileLog.d("start dns txt task");
-                    }
-                    GoogleDnsLoadTask task = new GoogleDnsLoadTask(currentAccount);
-                    task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, null, null, null);
-                    FileLog.d("8. currentTask = GoogleDnsLoadTask");
-                    currentTask = task;
-                });
-                FileLog.e(e, false);
-            }
-            return null;
-        }
-
-        @Override
-        protected void onPostExecute(NativeByteBuffer result) {
-
-        }
-    }
-
-    public static long lastPremiumFloodWaitShown = 0;
-    @Keep
-    public static void onPremiumFloodWait(final int currentAccount, final int requestToken, boolean isUpload) {
-        AndroidUtilities.runOnUIThread(() -> {
-            if (UserConfig.selectedAccount != currentAccount) {
-                return;
-            }
-            AndroidUtilities.runOnUIThread(() -> {
-                boolean updated = false;
-                if (isUpload) {
-                    FileUploadOperation operation = FileLoader.getInstance(currentAccount).findUploadOperationByRequestToken(requestToken);
-                    if (operation != null) {
-                        updated = !operation.caughtPremiumFloodWait;
-                        operation.caughtPremiumFloodWait = true;
-                    }
-                } else {
-                    FileLoadOperation operation = FileLoader.getInstance(currentAccount).findLoadOperationByRequestToken(requestToken);
-                    if (operation != null) {
-                        updated = !operation.caughtPremiumFloodWait;
-                        operation.caughtPremiumFloodWait = true;
-                    }
-                }
-                final boolean finalUpdated = updated;
-                if (finalUpdated) {
-                    NotificationCenter.getInstance(currentAccount).postNotificationName(NotificationCenter.premiumFloodWaitReceived);
-                }
-            });
-        });
-    }
-
-    @Keep
-    public static void onIntegrityCheckClassic(final int currentAccount, final int requestToken, final String project, final String nonce) {
-        AndroidUtilities.runOnUIThread(() -> {
-            long start = System.currentTimeMillis();
-            FileLog.d("account"+currentAccount+": server requests integrity classic check with project = "+project+" nonce = " + nonce);
-            IntegrityManager integrityManager = IntegrityManagerFactory.create(ApplicationLoader.applicationContext);
-            final long project_id;
-            try {
-                project_id = Long.parseLong(project);
-            } catch (Exception e) {
-                FileLog.d("account"+currentAccount+": integrity check failes to parse project id");
-                native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, "PLAYINTEGRITY_FAILED_EXCEPTION_NOPROJECT");
-                return;
-            }
-            Task<IntegrityTokenResponse> integrityTokenResponse = integrityManager.requestIntegrityToken(IntegrityTokenRequest.builder().setNonce(nonce).setCloudProjectNumber(project_id).build());
-            integrityTokenResponse
-                .addOnSuccessListener(r -> {
-                    final String token = r.token();
-
-                    if (token == null) {
-                        FileLog.e("account"+currentAccount+": integrity check gave null token in " + (System.currentTimeMillis() - start) + "ms");
-                        native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, "PLAYINTEGRITY_FAILED_EXCEPTION_NULL");
-                        return;
-                    }
-
-                    FileLog.d("account"+currentAccount+": integrity check successfully gave token: " + token + " in " + (System.currentTimeMillis() - start) + "ms");
-                    try {
-                        native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, token);
-                    } catch (Exception e) {
-                        FileLog.e("receivedIntegrityCheckClassic failed", e);
-                    }
-                })
-                .addOnFailureListener(e -> {
-                    FileLog.e("account"+currentAccount+": integrity check failed to give a token in " + (System.currentTimeMillis() - start) + "ms", e);
-                    native_receivedIntegrityCheckClassic(currentAccount, requestToken, nonce, "PLAYINTEGRITY_FAILED_EXCEPTION_" + LoginActivity.errorString(e));
-                });
-        });
-    }
-
-    @Keep
-    public static void onCaptchaCheck(final int currentAccount, final int requestToken, final String action, final String key_id) {
-        CaptchaController.request(currentAccount, requestToken, action, key_id);
+    public static void onCaptchaCheck(int currentAccount, int[] requestTokens, String token) {
+        native_receivedCaptchaResult(currentAccount, requestTokens, token);
     }
 }
