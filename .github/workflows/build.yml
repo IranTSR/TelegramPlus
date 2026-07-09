@@ -14,12 +14,10 @@ name: Build ZaStoGram APK
 # Without them, it builds with test APP_ID=4 (login may be limited).
 
 on:
-  workflow_dispatch: {}        # manual trigger by button
+  workflow_dispatch: {}
   push:
-    branches: [ master ]       # automatic on push to master
+    branches: [ master ]
 
-# One build per branch: new push/run cancels previous unfinished one to avoid pileups
-# and cache contention.
 concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: true
@@ -188,17 +186,15 @@ jobs:
       - name: Build Standalone APK (${{ matrix.abi }})
         env:
           USE_CCACHE: '1'
-          # The NDK is reinstalled every run, so its clang gets a fresh mtime each time.
-          # Hash the compiler by CONTENT (not mtime) so cached objects still hit across runs.
           CCACHE_COMPILERCHECK: content
-          # Tolerate __DATE__/__TIME__ macros and fresh-checkout header timestamps.
           CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
-          # Normalize absolute paths under the workspace so the hash is run-independent.
           CCACHE_BASEDIR: ${{ github.workspace }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
+          # Fix CRLF issue in gradlew
+          sed -i 's/\r$//' ./gradlew
           chmod +x ./gradlew
           SIGN_ARGS=""
           if [ -n "$KEYSTORE_PASSWORD" ]; then
