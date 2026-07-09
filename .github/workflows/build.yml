@@ -58,8 +58,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ========== اضافه شده: ساخت google-services.json ساختگی ==========
-      - name: Create dummy google-services.json for package org.zastogram.messenger
+      # ========== ساخت google-services.json کامل (با api_key) ==========
+      - name: Create dummy google-services.json with api_key for package org.zastogram.messenger
         run: |
           mkdir -p TMessagesProj_AppStandalone
           cat > TMessagesProj_AppStandalone/google-services.json <<'EOF'
@@ -79,7 +79,11 @@ jobs:
                   }
                 },
                 "oauth_client": [],
-                "api_key": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyDummyKeyThatIsLongEnoughForGoogleServices"
+                  }
+                ],
                 "services": {
                   "analytics_service": {
                     "status": 1
@@ -96,8 +100,8 @@ jobs:
             "configuration_version": "1"
           }
           EOF
-          echo "Dummy google-services.json created for package org.zastogram.messenger"
-      # ===============================================================
+          echo "Dummy google-services.json with api_key created for package org.zastogram.messenger"
+      # ================================================================
 
       - name: Free up disk space
         run: |
@@ -170,9 +174,6 @@ jobs:
           fi
 
       # All contract checks are temporarily disabled to allow the build to pass.
-      # They validate MTProxy, DNS, and UI contracts but are not required for core messaging functionality.
-      # To re-enable, change "if: false" to "if: true" for each step below.
-
       - name: Check MTProxy architecture guards
         if: false
         run: python3 Tools/check_mtproxy_all.py
@@ -234,7 +235,6 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: |
-          # Fix CRLF issue in gradlew
           sed -i 's/\r$//' ./gradlew
           chmod +x ./gradlew
           SIGN_ARGS=""
