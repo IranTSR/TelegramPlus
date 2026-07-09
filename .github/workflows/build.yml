@@ -58,6 +58,47 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ========== اضافه شده: ساخت google-services.json ساختگی ==========
+      - name: Create dummy google-services.json for package org.zastogram.messenger
+        run: |
+          mkdir -p TMessagesProj_AppStandalone
+          cat > TMessagesProj_AppStandalone/google-services.json <<'EOF'
+          {
+            "project_info": {
+              "project_number": "123456789",
+              "firebase_url": "https://example.firebaseio.com",
+              "project_id": "example",
+              "storage_bucket": "example.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789:android:abcdef",
+                  "android_client_info": {
+                    "package_name": "org.zastogram.messenger"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [],
+                "services": {
+                  "analytics_service": {
+                    "status": 1
+                  },
+                  "appinvite_service": {
+                    "status": 1
+                  },
+                  "ads_service": {
+                    "status": 1
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+          echo "Dummy google-services.json created for package org.zastogram.messenger"
+      # ===============================================================
+
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
